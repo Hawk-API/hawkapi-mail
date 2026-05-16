@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,7 +107,9 @@ class _StateNamespace:
     mail: Any
 
 
-_ACTIVE_MAILERS: dict[int, Mailer] = {}
+# WeakKeyDictionary keyed by the app object itself avoids the id() ABA hazard
+# (two different apps re-using the same id() slot after one is GC'd).
+_ACTIVE_MAILERS: weakref.WeakKeyDictionary[Any, Mailer] = weakref.WeakKeyDictionary()
 _LAST_MAILER: list[Mailer | None] = [None]
 
 
@@ -138,13 +142,15 @@ def init_mail(
     if getattr(app, "state", None) is None:
         app.state = _StateNamespace()
     app.state.mail = mailer
-    _ACTIVE_MAILERS[id(app)] = mailer
+    # Unhashable app object — fall back to state attachment + last-mailer slot.
+    with contextlib.suppress(TypeError):
+        _ACTIVE_MAILERS[app] = mailer
     _LAST_MAILER[0] = mailer
 
     if start_worker and mailer.worker is not None and hasattr(app, "on_startup"):
         worker = mailer.worker
 
-        def _start() -> None:
+        async def _start() -> None:
             worker.start()
 
         async def _stop() -> None:
@@ -159,7 +165,10 @@ def init_mail(
 def resolve_mailer(app: Any) -> Mailer | None:
     if app is None:
         return _LAST_MAILER[0]
-    mailer = _ACTIVE_MAILERS.get(id(app))
+    try:
+        mailer = _ACTIVE_MAILERS.get(app)
+    except TypeError:
+        mailer = None
     if mailer is not None:
         return mailer
     state = getattr(app, "state", None)

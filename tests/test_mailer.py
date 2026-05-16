@@ -110,7 +110,7 @@ def test_get_mailer_dep_500_when_not_configured() -> None:
 
     saved = _m._LAST_MAILER[0]
     _m._LAST_MAILER[0] = None
-    _m._ACTIVE_MAILERS.pop(id(app), None)
+    _m._ACTIVE_MAILERS.pop(app, None)
     try:
         client = TestClient(app)
         r = client.post("/notify")

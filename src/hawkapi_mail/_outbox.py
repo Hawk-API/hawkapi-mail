@@ -6,16 +6,19 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import aiosqlite
 
 from ._backends import Backend, SendError
 from ._message import Attachment, EmailMessage
+
+OutboxStatus = Literal["pending", "dead"]
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
@@ -39,6 +42,7 @@ class Outbox(Protocol):
     async def pull_due(self, *, now: float, limit: int = 10) -> list[OutboxEntry]: ...
     async def mark_sent(self, entry_id: int) -> None: ...
     async def mark_failed(self, entry_id: int, *, error: str, next_attempt_at: float) -> None: ...
+    async def mark_dead(self, entry_id: int, *, error: str) -> None: ...
     async def pending_count(self) -> int: ...
     async def close(self) -> None: ...
 
@@ -53,6 +57,7 @@ class MemoryOutbox:
     _entries: dict[int, OutboxEntry] = field(default_factory=dict)
     _next_id: int = 1
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    dead: list[OutboxEntry] = field(default_factory=list)
 
     async def enqueue(self, message: EmailMessage) -> int:
         async with self._lock:
@@ -87,6 +92,14 @@ class MemoryOutbox:
             entry.last_error = error
             entry.next_attempt_at = next_attempt_at
 
+    async def mark_dead(self, entry_id: int, *, error: str) -> None:
+        async with self._lock:
+            entry = self._entries.pop(entry_id, None)
+            if entry is None:
+                return
+            entry.last_error = error
+            self.dead.append(entry)
+
     async def pending_count(self) -> int:
         async with self._lock:
             return len(self._entries)
@@ -107,10 +120,21 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     created_at REAL NOT NULL,
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_next_attempt ON outbox(next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
 """
+
+
+async def _ensure_status_column(db: aiosqlite.Connection) -> None:
+    """Add the ``status`` column to legacy DBs that pre-date dead-lettering."""
+    cur = await db.execute("PRAGMA table_info(outbox)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "status" not in cols:
+        await db.execute("ALTER TABLE outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        await db.commit()
 
 
 @dataclass
@@ -124,6 +148,7 @@ class SQLiteOutbox:
             self._db = await aiosqlite.connect(str(self.path))
             await self._db.executescript(_SCHEMA)
             await self._db.commit()
+            await _ensure_status_column(self._db)
         return self._db
 
     async def enqueue(self, message: EmailMessage) -> int:
@@ -142,7 +167,8 @@ class SQLiteOutbox:
         async with self._lock:
             cur = await db.execute(
                 "SELECT id, message_json, attempts, next_attempt_at, created_at, last_error "
-                "FROM outbox WHERE next_attempt_at <= ? ORDER BY next_attempt_at LIMIT ?",
+                "FROM outbox WHERE status = 'pending' AND next_attempt_at <= ? "
+                "ORDER BY next_attempt_at LIMIT ?",
                 (now, limit),
             )
             rows = await cur.fetchall()
@@ -174,10 +200,19 @@ class SQLiteOutbox:
             )
             await db.commit()
 
+    async def mark_dead(self, entry_id: int, *, error: str) -> None:
+        db = await self._connect()
+        async with self._lock:
+            await db.execute(
+                "UPDATE outbox SET status = 'dead', last_error = ? WHERE id = ?",
+                (error, entry_id),
+            )
+            await db.commit()
+
     async def pending_count(self) -> int:
         db = await self._connect()
         async with self._lock:
-            cur = await db.execute("SELECT COUNT(*) FROM outbox")
+            cur = await db.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending'")
             row = await cur.fetchone()
         return int(row[0]) if row else 0
 
@@ -260,8 +295,11 @@ class RetryPolicy:
     max_seconds: float = 3600.0
 
     def delay_for(self, attempt: int) -> float:
-        """Exponential backoff: 5s, 10s, 20s, 40s, ... capped at max_seconds."""
-        return min(self.base_seconds * (2 ** max(attempt - 1, 0)), self.max_seconds)
+        """Exponential backoff with +/-20% jitter, capped at ``max_seconds``."""
+        delay = min(self.base_seconds * (2 ** max(attempt - 1, 0)), self.max_seconds)
+        if delay <= 0:
+            return 0.0
+        return random.uniform(delay * 0.8, delay * 1.2)  # noqa: S311 — jitter, not crypto
 
 
 @dataclass
@@ -311,16 +349,18 @@ class OutboxWorker:
     async def _send_one(self, entry: OutboxEntry) -> None:
         try:
             await self.backend.send(entry.message)
-        except SendError as exc:
-            err = str(exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            err = str(exc) if isinstance(exc, SendError) else f"{type(exc).__name__}: {exc}"
             if entry.attempts + 1 >= self.retry.max_attempts:
                 logger.error(
-                    "outbox entry %s exhausted retries after %d attempts: %s",
+                    "outbox entry %s dead-lettered after %d attempts: %s",
                     entry.id,
                     entry.attempts + 1,
-                    err,
+                    err[:100],
                 )
-                await self.outbox.mark_sent(entry.id)
+                await self.outbox.mark_dead(entry.id, error=err)
                 return
             delay = self.retry.delay_for(entry.attempts + 1)
             await self.outbox.mark_failed(entry.id, error=err, next_attempt_at=time.time() + delay)
@@ -339,6 +379,7 @@ __all__ = [
     "MemoryOutbox",
     "Outbox",
     "OutboxEntry",
+    "OutboxStatus",
     "OutboxWorker",
     "RetryPolicy",
     "SQLiteOutbox",

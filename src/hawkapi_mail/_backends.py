@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import ssl
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -11,6 +12,8 @@ import aiosmtplib
 import httpx
 
 from ._message import EmailMessage
+
+logger = logging.getLogger("hawkapi_mail.backends")
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
@@ -79,7 +82,8 @@ class SMTPBackend:
                 tls_context=ctx,
             )
         except aiosmtplib.SMTPException as exc:
-            raise SendError(f"SMTP error: {exc}") from exc
+            logger.debug("SMTP send failure: %s", exc)
+            raise SendError("SMTP send failed") from exc
         return SendResult(message_id=message.message_id, provider="smtp")
 
     async def close(self) -> None:
@@ -152,7 +156,8 @@ class SESBackend:
         try:
             resp = client.send_raw_email(**kw)
         except Exception as exc:  # pragma: no cover - network
-            raise SendError(f"SES error: {exc}") from exc
+            logger.debug("SES send failure: %s", exc)
+            raise SendError("SES send failed") from exc
         return SendResult(
             message_id=message.message_id,
             provider="ses",
@@ -190,7 +195,8 @@ class SendGridBackend(_HTTPMixin):
             json=payload,
         )
         if resp.status_code >= 300:
-            raise SendError(f"SendGrid {resp.status_code}: {resp.text}")
+            logger.debug("SendGrid %s response body: %s", resp.status_code, resp.text)
+            raise SendError(f"SendGrid send failed (status={resp.status_code})")
         provider_id = resp.headers.get("x-message-id", "")
         return SendResult(
             message_id=message.message_id,
@@ -305,7 +311,8 @@ class MailgunBackend(_HTTPMixin):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         if resp.status_code >= 300:
-            raise SendError(f"Mailgun {resp.status_code}: {resp.text}")
+            logger.debug("Mailgun %s response body: %s", resp.status_code, resp.text)
+            raise SendError(f"Mailgun send failed (status={resp.status_code})")
         body = resp.json()
         return SendResult(
             message_id=message.message_id,
@@ -368,7 +375,8 @@ class ResendBackend(_HTTPMixin):
             json=body,
         )
         if resp.status_code >= 300:
-            raise SendError(f"Resend {resp.status_code}: {resp.text}")
+            logger.debug("Resend %s response body: %s", resp.status_code, resp.text)
+            raise SendError(f"Resend send failed (status={resp.status_code})")
         data = resp.json()
         return SendResult(
             message_id=message.message_id,

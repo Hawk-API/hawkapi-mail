@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hawkapi-mail"
-version = "0.1.0"
+version = "0.2.0"
 description = "Email plugin for HawkAPI — SMTP, SES, SendGrid, Mailgun, Resend, Jinja2, webhooks, persistent outbox"
 readme = "README.md"
 license = { file = "LICENSE" }

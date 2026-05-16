@@ -90,10 +90,11 @@ async def test_sqlite_outbox_preserves_attachments(tmp_path: object) -> None:
 
 def test_retry_policy_backoff() -> None:
     p = RetryPolicy(base_seconds=5, max_seconds=100)
-    assert p.delay_for(1) == 5
-    assert p.delay_for(2) == 10
-    assert p.delay_for(3) == 20
-    assert p.delay_for(10) == 100  # capped
+    # With +/-20% jitter: delay should be within [base*0.8, base*1.2].
+    assert 4.0 <= p.delay_for(1) <= 6.0
+    assert 8.0 <= p.delay_for(2) <= 12.0
+    assert 16.0 <= p.delay_for(3) <= 24.0
+    assert 80.0 <= p.delay_for(10) <= 120.0  # capped at 100, then jittered
 
 
 async def test_worker_drains_pending() -> None:
@@ -133,7 +134,7 @@ async def test_worker_retries_on_send_error() -> None:
     assert len(backend.sent) == 1
 
 
-async def test_worker_drops_after_max_attempts() -> None:
+async def test_worker_dead_letters_after_max_attempts() -> None:
     class AlwaysFail(InMemoryBackend):
         async def send(self, message):  # type: ignore[override]
             raise SendError("permanent")
@@ -147,7 +148,46 @@ async def test_worker_drops_after_max_attempts() -> None:
     await w.drain_once()
     assert await ob.pending_count() == 1
     await w.drain_once()
-    assert await ob.pending_count() == 0  # dropped after max_attempts
+    assert await ob.pending_count() == 0  # no longer pending
+    assert len(ob.dead) == 1  # dead-lettered, not silently deleted
+    assert "permanent" in ob.dead[0].last_error
+
+
+async def test_worker_handles_non_send_error_exceptions() -> None:
+    class Exploder(InMemoryBackend):
+        attempts: int = 0
+
+        async def send(self, message):  # type: ignore[override]
+            self.attempts += 1
+            raise RuntimeError("kaboom")
+
+    ob = MemoryOutbox()
+    backend = Exploder()
+    await ob.enqueue(_make_message())
+    w = OutboxWorker(
+        outbox=ob, backend=backend, retry=RetryPolicy(max_attempts=2, base_seconds=0.0)
+    )
+    # First drain — should not propagate, entry remains for retry.
+    await w.drain_once()
+    assert await ob.pending_count() == 1
+    # Second drain — exhausts retries, entry is dead-lettered.
+    await w.drain_once()
+    assert await ob.pending_count() == 0
+    assert len(ob.dead) == 1
+    assert "RuntimeError" in ob.dead[0].last_error
+
+
+async def test_sqlite_outbox_dead_letter(tmp_path: object) -> None:
+    from pathlib import Path
+
+    db = Path(tmp_path) / "out.db"  # type: ignore[arg-type]
+    ob = SQLiteOutbox(path=db)
+    eid = await ob.enqueue(_make_message())
+    await ob.mark_dead(eid, error="boom")
+    assert await ob.pending_count() == 0
+    # pull_due must not return dead rows.
+    assert await ob.pull_due(now=time.time() + 1000) == []
+    await ob.close()
 
 
 async def test_worker_start_stop_runs_background_loop() -> None:

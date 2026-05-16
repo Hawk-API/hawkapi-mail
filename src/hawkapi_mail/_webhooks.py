@@ -12,12 +12,16 @@ import hashlib
 import hmac
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
 
 logger = logging.getLogger("hawkapi_mail.webhooks")
+
+_SNS_URL_RE = re.compile(r"^https://sns\.[a-z0-9-]+\.amazonaws\.com/")
 
 
 EventKind = Literal[
@@ -58,7 +62,10 @@ def verify_sendgrid(
     timestamp: str,
 ) -> None:
     try:
-        from cryptography.hazmat.primitives import hashes, serialization  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives import (  # type: ignore[import-not-found]
+            hashes,
+            serialization,
+        )
         from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover
         raise SignatureError("cryptography required for SendGrid verification") from exc
@@ -119,7 +126,14 @@ def verify_mailgun(
     timestamp: str,
     token: str,
     signature: str,
+    max_age_seconds: int = 900,
 ) -> None:
+    try:
+        ts_int = int(timestamp)
+    except (ValueError, TypeError) as exc:
+        raise SignatureError("invalid timestamp") from exc
+    if abs(time.time() - ts_int) > max_age_seconds:
+        raise SignatureError("timestamp out of window")
     expected = hmac.new(
         signing_key.encode("utf-8"),
         msg=f"{timestamp}{token}".encode(),
@@ -169,9 +183,17 @@ def verify_resend(
     timestamp: str,
     signature: str,
     payload: bytes,
+    max_age_seconds: int = 300,
 ) -> None:
     """Resend uses Svix — header format: ``v1,<base64>`` (may be multiple, space-separated)."""
     import base64
+
+    try:
+        ts_int = int(timestamp)
+    except (ValueError, TypeError) as exc:
+        raise SignatureError("invalid timestamp") from exc
+    if abs(time.time() - ts_int) > max_age_seconds:
+        raise SignatureError("timestamp out of window")
 
     secret = signing_secret
     if secret.startswith("whsec_"):
@@ -266,11 +288,18 @@ async def confirm_ses_subscription(
     url = raw.get("SubscribeURL")
     if not url:
         return False
+    if not _SNS_URL_RE.match(url):
+        logger.warning("Rejecting suspicious SubscribeURL: %s", url[:200])
+        return False
     own_client = client is None
-    c = client or httpx.AsyncClient(timeout=10.0)
+    c = client or httpx.AsyncClient(timeout=10.0, follow_redirects=False)
     try:
-        resp = await c.get(url)
-        resp.raise_for_status()
+        resp = await c.get(url, follow_redirects=False)
+        if resp.status_code != 200:
+            logger.warning(
+                "SNS SubscribeURL returned non-200 (%d); refusing to follow", resp.status_code
+            )
+            return False
     finally:
         if own_client:
             await c.aclose()

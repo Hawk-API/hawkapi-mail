@@ -6,11 +6,14 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 
+import httpx
 import pytest
 
 from hawkapi_mail import (
     SignatureError,
+    confirm_ses_subscription,
     parse_mailgun,
     parse_resend,
     parse_sendgrid,
@@ -26,7 +29,7 @@ from hawkapi_mail import (
 
 def test_verify_mailgun_accepts_correct_signature() -> None:
     key = "secret"
-    timestamp = "1700000000"
+    timestamp = str(int(time.time()))
     token = "tok-abc"
     sig = hmac.new(
         key.encode(), msg=f"{timestamp}{token}".encode(), digestmod=hashlib.sha256
@@ -35,8 +38,23 @@ def test_verify_mailgun_accepts_correct_signature() -> None:
 
 
 def test_verify_mailgun_rejects_bad_signature() -> None:
+    timestamp = str(int(time.time()))
     with pytest.raises(SignatureError):
-        verify_mailgun(signing_key="secret", timestamp="t", token="tok", signature="bad")
+        verify_mailgun(signing_key="secret", timestamp=timestamp, token="tok", signature="bad")
+
+
+def test_verify_mailgun_rejects_old_timestamp() -> None:
+    key = "secret"
+    old = str(int(time.time()) - 3600)
+    token = "tok-abc"
+    sig = hmac.new(key.encode(), msg=f"{old}{token}".encode(), digestmod=hashlib.sha256).hexdigest()
+    with pytest.raises(SignatureError):
+        verify_mailgun(signing_key=key, timestamp=old, token=token, signature=sig)
+
+
+def test_verify_mailgun_rejects_non_numeric_timestamp() -> None:
+    with pytest.raises(SignatureError):
+        verify_mailgun(signing_key="secret", timestamp="not-a-ts", token="tok", signature="x")
 
 
 def test_parse_mailgun_delivered() -> None:
@@ -96,7 +114,7 @@ def test_parse_sendgrid_unknown_event_falls_back_to_other() -> None:
 def test_verify_resend_accepts_correct_signature() -> None:
     secret = base64.b64encode(b"my-secret-bytes").decode()
     msg_id = "msg_123"
-    timestamp = "1700000000"
+    timestamp = str(int(time.time()))
     payload = b'{"type":"email.delivered"}'
     raw_secret = base64.b64decode(secret)
     sig = base64.b64encode(
@@ -115,13 +133,34 @@ def test_verify_resend_accepts_correct_signature() -> None:
 
 def test_verify_resend_rejects_bad_signature() -> None:
     secret = base64.b64encode(b"my-secret-bytes").decode()
+    timestamp = str(int(time.time()))
     with pytest.raises(SignatureError):
         verify_resend(
             signing_secret=secret,
             msg_id="m",
-            timestamp="t",
+            timestamp=timestamp,
             signature="v1,YmFkc2ln",
             payload=b"{}",
+        )
+
+
+def test_verify_resend_rejects_old_timestamp() -> None:
+    secret = base64.b64encode(b"my-secret-bytes").decode()
+    old = str(int(time.time()) - 3600)
+    payload = b'{"type":"email.delivered"}'
+    raw_secret = base64.b64decode(secret)
+    sig = base64.b64encode(
+        hmac.new(
+            raw_secret, msg=f"msg_1.{old}.".encode() + payload, digestmod=hashlib.sha256
+        ).digest()
+    ).decode()
+    with pytest.raises(SignatureError):
+        verify_resend(
+            signing_secret=secret,
+            msg_id="msg_1",
+            timestamp=old,
+            signature=f"v1,{sig}",
+            payload=payload,
         )
 
 
@@ -154,3 +193,81 @@ def test_parse_ses_sns_ignores_non_notification() -> None:
     body = {"Type": "SubscriptionConfirmation"}
     events = parse_ses_sns(json.dumps(body).encode())
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# confirm_ses_subscription — SSRF guard
+# ---------------------------------------------------------------------------
+
+
+async def test_confirm_ses_subscription_rejects_non_aws_url() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text="ok")
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        body = json.dumps(
+            {"Type": "SubscriptionConfirmation", "SubscribeURL": "http://evil.com/confirm"}
+        ).encode()
+        result = await confirm_ses_subscription(body, client=client)
+    assert result is False
+    assert calls == []
+
+
+async def test_confirm_ses_subscription_rejects_lookalike_domain() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body = json.dumps(
+            {
+                "Type": "SubscriptionConfirmation",
+                "SubscribeURL": "https://sns.us-east-1.amazonaws.com.evil.com/x",
+            }
+        ).encode()
+        result = await confirm_ses_subscription(body, client=client)
+    assert result is False
+    assert calls == []
+
+
+async def test_confirm_ses_subscription_accepts_aws_url() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body = json.dumps(
+            {
+                "Type": "SubscriptionConfirmation",
+                "SubscribeURL": (
+                    "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&Token=abc"
+                ),
+            }
+        ).encode()
+        result = await confirm_ses_subscription(body, client=client)
+    assert result is True
+    assert len(calls) == 1
+    assert "sns.us-east-1.amazonaws.com" in str(calls[0].url)
+
+
+async def test_confirm_ses_subscription_rejects_non_200() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "http://evil.com"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        body = json.dumps(
+            {
+                "Type": "SubscriptionConfirmation",
+                "SubscribeURL": "https://sns.us-east-1.amazonaws.com/x",
+            }
+        ).encode()
+        result = await confirm_ses_subscription(body, client=client)
+    assert result is False

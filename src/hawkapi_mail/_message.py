@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import mimetypes
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from email.message import EmailMessage as _StdlibMessage
 from email.utils import formataddr, make_msgid
 from pathlib import Path
 from typing import Any
+
+_CRLF_RE = re.compile(r"[\r\n\x00]")
+
+
+def _check_header(name: str, value: str) -> None:
+    """Reject CR/LF/NUL in header names or values (CWE-74)."""
+    if _CRLF_RE.search(name) or _CRLF_RE.search(value):
+        raise ValueError(f"header injection attempt: name={name[:32]!r} value={value[:32]!r}")
 
 
 @dataclass(slots=True)
@@ -97,6 +106,21 @@ class EmailMessage:
 
     def to_mime(self) -> bytes:
         """Render to RFC822 bytes (used by SMTP + raw-mode SES)."""
+        # Validate every header name/value for CR/LF/NUL before stdlib accepts it.
+        _check_header("Subject", self.subject)
+        if self.sender:
+            _check_header("From", self.sender)
+        for addr in self.to:
+            _check_header("To", addr)
+        for addr in self.cc:
+            _check_header("Cc", addr)
+        for addr in self.bcc:
+            _check_header("Bcc", addr)
+        for addr in self.reply_to:
+            _check_header("Reply-To", addr)
+        for k, v in self.headers.items():
+            _check_header(k, v)
+
         msg = _StdlibMessage()
         msg["Subject"] = self.subject
         if self.sender:

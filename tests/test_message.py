@@ -108,3 +108,74 @@ def test_headers_and_reply_to_in_mime() -> None:
 def test_build_normalizes_empty_recipients(to_value: object, expected: list[str]) -> None:
     msg = EmailMessage.build(subject="hi", sender="a@b.c", to=to_value)  # type: ignore[arg-type]
     assert msg.to == expected
+
+
+# ---------------------------------------------------------------------------
+# Header injection (CWE-74) — CRLF/NUL must be rejected in to_mime
+# ---------------------------------------------------------------------------
+
+
+def test_to_mime_rejects_crlf_in_subject() -> None:
+    msg = EmailMessage.build(subject="hi\r\nBcc: evil@x", sender="a@b.c", to="x@y.z")
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_lf_in_subject() -> None:
+    msg = EmailMessage.build(subject="hi\nBcc: evil@x", sender="a@b.c", to="x@y.z")
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_sender() -> None:
+    msg = EmailMessage.build(subject="hi", sender="a@b.c\r\nBcc: evil@x", to="x@y.z")
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_to_recipient() -> None:
+    msg = EmailMessage.build(subject="hi", sender="a@b.c", to=["x@y.z\r\nBcc: evil@x"])
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_cc_recipient() -> None:
+    msg = EmailMessage.build(subject="hi", sender="a@b.c", to="x@y.z", cc=["c@x.y\r\nX: y"])
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_reply_to() -> None:
+    msg = EmailMessage.build(
+        subject="hi", sender="a@b.c", to="x@y.z", reply_to=["r@x.y\r\nX-Evil: 1"]
+    )
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_header_value() -> None:
+    msg = EmailMessage.build(
+        subject="hi",
+        sender="a@b.c",
+        to="x@y.z",
+        headers={"X-Test": "value\r\nY: z"},
+    )
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_crlf_in_header_name() -> None:
+    msg = EmailMessage.build(
+        subject="hi",
+        sender="a@b.c",
+        to="x@y.z",
+        headers={"X-Test\r\nY": "v"},
+    )
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()
+
+
+def test_to_mime_rejects_nul_byte() -> None:
+    msg = EmailMessage.build(subject="hi\x00there", sender="a@b.c", to="x@y.z")
+    with pytest.raises(ValueError, match="header injection"):
+        msg.to_mime()

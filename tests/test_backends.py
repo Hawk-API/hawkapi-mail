@@ -73,8 +73,10 @@ async def test_smtp_backend_wraps_smtp_exception(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("aiosmtplib.send", boom)
     backend = SMTPBackend(config=SMTPConfig())
     msg = EmailMessage.build(subject="t", sender="a@b.c", to="x@y.z", text="hi")
-    with pytest.raises(SendError, match="nope"):
+    with pytest.raises(SendError, match="SMTP send failed") as exc_info:
         await backend.send(msg)
+    # Underlying exception still chained for debugging, but not in user-facing message.
+    assert "nope" in str(exc_info.value.__cause__)
 
 
 # ---------------------------------------------------------------------------
