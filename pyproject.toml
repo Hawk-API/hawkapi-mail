@@ -45,8 +45,8 @@ dev = [
 
 [project.urls]
 Homepage = "https://pypi.org/project/hawkapi-mail/"
-Repository = "https://github.com/ashimov/hawkapi-mail"
-Issues = "https://github.com/ashimov/hawkapi-mail/issues"
+Repository = "https://github.com/Hawk-API/hawkapi-mail"
+Issues = "https://github.com/Hawk-API/hawkapi-mail/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hawkapi_mail"]

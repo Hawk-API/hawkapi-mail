@@ -1,6 +1,6 @@
 # hawkapi-mail
 
-Email plugin for [HawkAPI](https://github.com/ashimov/HawkAPI). SMTP, AWS SES, SendGrid, Mailgun, Resend, Jinja2 templates, persistent outbox with retry, and webhook handlers for delivery/bounce/complaint events.
+Email plugin for [HawkAPI](https://github.com/Hawk-API/HawkAPI). SMTP, AWS SES, SendGrid, Mailgun, Resend, Jinja2 templates, persistent outbox with retry, and webhook handlers for delivery/bounce/complaint events.
 
 ## Install
 
@@ -152,7 +152,7 @@ backend.clear()
 ## Development
 
 ```bash
-git clone https://github.com/ashimov/hawkapi-mail.git
+git clone https://github.com/Hawk-API/hawkapi-mail.git
 cd hawkapi-mail
 uv sync --extra dev
 uv run pytest -q
