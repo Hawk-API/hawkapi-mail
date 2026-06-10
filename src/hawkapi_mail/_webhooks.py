@@ -313,9 +313,7 @@ def _sns_string_to_sign(raw: dict[str, Any]) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
-async def verify_sns_message(
-    payload: bytes, *, client: httpx.AsyncClient | None = None
-) -> None:
+async def verify_sns_message(payload: bytes, *, client: httpx.AsyncClient | None = None) -> None:
     """Verify an SNS message's RSA signature against its signing certificate.
 
     Validates ``SigningCertURL`` is HTTPS on an ``sns.<region>.amazonaws.com``
@@ -333,8 +331,7 @@ async def verify_sns_message(
         )
     except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
         raise SignatureError(
-            "cryptography is required for SNS signature verification "
-            "(install hawkapi-mail[ses])"
+            "cryptography is required for SNS signature verification (install hawkapi-mail[ses])"
         ) from exc
 
     import base64
