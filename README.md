@@ -6,8 +6,10 @@ Email plugin for [HawkAPI](https://github.com/Hawk-API/HawkAPI). SMTP, AWS SES, 
 
 ```bash
 pip install hawkapi-mail            # SMTP + SendGrid + Mailgun + Resend + outbox
-pip install 'hawkapi-mail[ses]'     # adds AWS SES backend
+pip install 'hawkapi-mail[ses]'     # adds AWS SES backend + SNS signature verification
 ```
+
+The `[ses]` extra pulls in `cryptography`, which is required both for the SES backend (boto3) and for verifying SNS webhook signatures (see [Webhooks](#webhooks)).
 
 ## Quickstart
 
@@ -61,6 +63,10 @@ ses      = SESBackend(SESConfig(region="eu-west-1"))   # uses boto3 / IAM
 
 All backends share one async `send(message) -> SendResult` interface; swap them freely.
 
+Every backend validates the message (subject, sender, recipients, and custom headers) before sending and rejects CR/LF/NUL — so the HTTP backends (SendGrid/Mailgun/Resend) get the same header-injection protection as the SMTP/SES path.
+
+`SMTPConfig.validate_certs` defaults to `True` and should stay `True` in production. Setting it to `False` disables TLS certificate verification and emits a `UserWarning` — use it only against a local/test SMTP server with a self-signed certificate.
+
 ## Templates
 
 ```python
@@ -78,7 +84,7 @@ await mail.send_template(
 )
 ```
 
-Jinja2 with async rendering + HTML autoescape on by default.
+Jinja2 with async rendering + HTML autoescape on by default. Templates render in a Jinja2 `SandboxedEnvironment`, which blocks access to unsafe attributes and builtins. This means `render_string(source, **context)` is safe against template-injection (SSTI/RCE) escalation even when the rendering *context* is attacker-controlled. The template *source* itself is still trusted code, so passing user-supplied template source is discouraged; keep templates under your control (files, package, or a fixed `templates={...}` mapping).
 
 ## Persistent outbox
 
@@ -134,6 +140,8 @@ async def ses_hook(request):
 ```
 
 All providers normalize to a single `WebhookEvent(provider, kind, recipient, message_id, timestamp, raw)`.
+
+For SES, `confirm_ses_subscription(body)` verifies the SNS message's RSA signature against its AWS signing certificate before hitting `SubscribeURL` (the `SigningCertURL`/`SubscribeURL` hosts are allowlisted to `sns.<region>.amazonaws.com` and redirects are disabled). Pass `verify_signature=False` only if you already verified upstream. You can also verify any SNS message directly with `verify_sns_message(body)`, which raises `SignatureError` on failure. Signature verification needs `cryptography`, installed via the `[ses]` extra (`pip install 'hawkapi-mail[ses]'`).
 
 ## Testing
 
