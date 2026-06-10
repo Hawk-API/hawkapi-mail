@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 — 2026-06-10
+
+Security hardening.
+
+- Jinja2 templating now uses a sandboxed environment, preventing SSTI/RCE via `render_string` (CWE-94/1336).
+- All HTTP backends (SendGrid/Mailgun/Resend) validate subject/sender/recipients and custom headers for CRLF/NUL before sending (CWE-93), matching the SMTP/SES path.
+- SNS subscription/notification handling now verifies the message RSA signature against the AWS signing certificate (CWE-345).
+- Secret config fields (passwords, API keys, AWS secret) are excluded from dataclass `repr` (CWE-532).
+- `validate_certs=False` now emits a warning before disabling TLS verification.
+- Provider error response bodies are truncated in debug logs; SendGrid no longer stores full response headers (CWE-532).
+
 ## 0.2.0 — 2026-05-16
 
 Security + reliability hardening.

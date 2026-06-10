@@ -46,9 +46,10 @@ from ._webhooks import (
     verify_mailgun,
     verify_resend,
     verify_sendgrid,
+    verify_sns_message,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Attachment",
@@ -92,4 +93,5 @@ __all__ = [
     "verify_mailgun",
     "verify_resend",
     "verify_sendgrid",
+    "verify_sns_message",
 ]

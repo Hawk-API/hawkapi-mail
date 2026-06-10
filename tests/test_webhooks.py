@@ -20,6 +20,7 @@ from hawkapi_mail import (
     parse_ses_sns,
     verify_mailgun,
     verify_resend,
+    verify_sns_message,
 )
 
 # ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ async def test_confirm_ses_subscription_rejects_non_aws_url() -> None:
         body = json.dumps(
             {"Type": "SubscriptionConfirmation", "SubscribeURL": "http://evil.com/confirm"}
         ).encode()
-        result = await confirm_ses_subscription(body, client=client)
+        result = await confirm_ses_subscription(body, client=client, verify_signature=False)
     assert result is False
     assert calls == []
 
@@ -231,7 +232,7 @@ async def test_confirm_ses_subscription_rejects_lookalike_domain() -> None:
                 "SubscribeURL": "https://sns.us-east-1.amazonaws.com.evil.com/x",
             }
         ).encode()
-        result = await confirm_ses_subscription(body, client=client)
+        result = await confirm_ses_subscription(body, client=client, verify_signature=False)
     assert result is False
     assert calls == []
 
@@ -252,7 +253,7 @@ async def test_confirm_ses_subscription_accepts_aws_url() -> None:
                 ),
             }
         ).encode()
-        result = await confirm_ses_subscription(body, client=client)
+        result = await confirm_ses_subscription(body, client=client, verify_signature=False)
     assert result is True
     assert len(calls) == 1
     assert "sns.us-east-1.amazonaws.com" in str(calls[0].url)
@@ -269,5 +270,165 @@ async def test_confirm_ses_subscription_rejects_non_200() -> None:
                 "SubscribeURL": "https://sns.us-east-1.amazonaws.com/x",
             }
         ).encode()
-        result = await confirm_ses_subscription(body, client=client)
+        result = await confirm_ses_subscription(body, client=client, verify_signature=False)
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# verify_sns_message — RSA signature against signing certificate (CWE-345)
+# ---------------------------------------------------------------------------
+
+pytest.importorskip("cryptography")
+
+CERT_URL = "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem"
+
+
+def _make_signed_sns(message_type: str = "Notification") -> tuple[dict, bytes]:
+    """Build a self-signed cert and a v1 (SHA1) signed SNS payload."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "sns.amazonaws.com")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1))
+        .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+
+    if message_type == "Notification":
+        msg = {
+            "Type": "Notification",
+            "MessageId": "id-1",
+            "TopicArn": "arn:aws:sns:us-east-1:123:topic",
+            "Message": '{"eventType":"Delivery"}',
+            "Timestamp": "2026-06-10T00:00:00.000Z",
+            "SignatureVersion": "1",
+            "SigningCertURL": CERT_URL,
+        }
+        fields = ("Message", "MessageId", "Subject", "Timestamp", "TopicArn", "Type")
+    else:
+        msg = {
+            "Type": "SubscriptionConfirmation",
+            "MessageId": "id-1",
+            "TopicArn": "arn:aws:sns:us-east-1:123:topic",
+            "Message": "You have chosen to subscribe",
+            "SubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription",
+            "Token": "tok",
+            "Timestamp": "2026-06-10T00:00:00.000Z",
+            "SignatureVersion": "1",
+            "SigningCertURL": CERT_URL,
+        }
+        fields = ("Message", "MessageId", "SubscribeURL", "Timestamp", "Token", "TopicArn", "Type")
+
+    string_to_sign = "".join(
+        f"{k}\n{msg[k]}\n" for k in fields if k != "Subject" or k in msg
+    ).encode()
+    signature = key.sign(string_to_sign, padding.PKCS1v15(), hashes.SHA1())
+    msg["Signature"] = base64.b64encode(signature).decode()
+    return msg, cert_pem
+
+
+def _cert_client(cert_pem: bytes) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=cert_pem)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_verify_sns_message_accepts_valid_signature() -> None:
+    msg, cert_pem = _make_signed_sns("Notification")
+    async with _cert_client(cert_pem) as client:
+        await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_accepts_subscription_confirmation() -> None:
+    msg, cert_pem = _make_signed_sns("SubscriptionConfirmation")
+    async with _cert_client(cert_pem) as client:
+        await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_rejects_tampered_message() -> None:
+    msg, cert_pem = _make_signed_sns("Notification")
+    msg["Message"] = '{"eventType":"Bounce"}'  # tamper after signing
+    async with _cert_client(cert_pem) as client:
+        with pytest.raises(SignatureError):
+            await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_rejects_untrusted_cert_url() -> None:
+    msg, cert_pem = _make_signed_sns("Notification")
+    msg["SigningCertURL"] = "https://evil.com/cert.pem"
+    async with _cert_client(cert_pem) as client:
+        with pytest.raises(SignatureError, match="untrusted"):
+            await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_rejects_http_cert_url() -> None:
+    msg, cert_pem = _make_signed_sns("Notification")
+    msg["SigningCertURL"] = "http://sns.us-east-1.amazonaws.com/cert.pem"
+    async with _cert_client(cert_pem) as client:
+        with pytest.raises(SignatureError):
+            await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_rejects_unknown_signature_version() -> None:
+    msg, cert_pem = _make_signed_sns("Notification")
+    msg["SignatureVersion"] = "9"
+    async with _cert_client(cert_pem) as client:
+        with pytest.raises(SignatureError):
+            await verify_sns_message(json.dumps(msg).encode(), client=client)
+
+
+async def test_verify_sns_message_missing_cryptography(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "cryptography" or name.startswith("cryptography."):
+            raise ImportError("no cryptography")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(SignatureError, match="cryptography"):
+        await verify_sns_message(b"{}")
+
+
+async def test_confirm_ses_subscription_verifies_signature() -> None:
+    msg, cert_pem = _make_signed_sns("SubscriptionConfirmation")
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if str(request.url) == CERT_URL:
+            return httpx.Response(200, content=cert_pem)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await confirm_ses_subscription(json.dumps(msg).encode(), client=client)
+    assert result is True
+    # cert fetch + subscribe confirm
+    assert len(calls) == 2
+
+
+async def test_confirm_ses_subscription_rejects_forged_signature() -> None:
+    msg, cert_pem = _make_signed_sns("SubscriptionConfirmation")
+    msg["Token"] = "forged"  # tamper after signing
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=cert_pem)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SignatureError):
+            await confirm_ses_subscription(json.dumps(msg).encode(), client=client)

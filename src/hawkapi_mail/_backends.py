@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import ssl
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -48,11 +49,12 @@ class SMTPConfig:
     host: str = "localhost"
     port: int = 25
     username: str = ""
-    password: str = ""
+    password: str = field(default="", repr=False)
     use_tls: bool = False  # implicit TLS / SMTPS (port 465)
     start_tls: bool = False  # STARTTLS (port 587)
     timeout: float = 30.0
     validate_certs: bool = True
+    """Disable TLS certificate verification. Test-only — unsafe in production."""
 
 
 @dataclass
@@ -61,10 +63,16 @@ class SMTPBackend:
     name: str = "smtp"
 
     async def send(self, message: EmailMessage) -> SendResult:
+        message.validate()
         if not message.sender:
             raise SendError("sender required for SMTP")
         ctx = ssl.create_default_context()
         if not self.config.validate_certs:
+            warnings.warn(
+                "SMTP TLS certificate verification disabled (validate_certs=False) "
+                "— unsafe outside tests",
+                stacklevel=2,
+            )
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         try:
@@ -119,7 +127,7 @@ class _HTTPMixin:
 class SESConfig:
     region: str = "us-east-1"
     aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
+    aws_secret_access_key: str = field(default="", repr=False)
     configuration_set: str = ""
 
 
@@ -144,6 +152,7 @@ class SESBackend:
         return self._client
 
     async def send(self, message: EmailMessage) -> SendResult:
+        message.validate()
         client = self._get_client()
         raw = message.to_mime()
         kw: dict[str, Any] = {
@@ -176,7 +185,7 @@ class SESBackend:
 
 @dataclass(slots=True)
 class SendGridConfig:
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str = "https://api.sendgrid.com"
     timeout: float = 30.0
 
@@ -187,6 +196,7 @@ class SendGridBackend(_HTTPMixin):
     name: str = "sendgrid"
 
     async def send(self, message: EmailMessage) -> SendResult:
+        message.validate()
         payload = _sendgrid_payload(message)
         client = self._get_client(self.config.timeout)
         resp = await client.post(
@@ -195,14 +205,14 @@ class SendGridBackend(_HTTPMixin):
             json=payload,
         )
         if resp.status_code >= 300:
-            logger.debug("SendGrid %s response body: %s", resp.status_code, resp.text)
+            logger.debug("SendGrid %s response body: %s", resp.status_code, resp.text[:500])
             raise SendError(f"SendGrid send failed (status={resp.status_code})")
         provider_id = resp.headers.get("x-message-id", "")
         return SendResult(
             message_id=message.message_id,
             provider="sendgrid",
             provider_message_id=provider_id,
-            raw_response={"status_code": resp.status_code, "headers": dict(resp.headers)},
+            raw_response={"status_code": resp.status_code, "message_id": provider_id},
         )
 
 
@@ -254,7 +264,7 @@ def _sendgrid_payload(message: EmailMessage) -> dict[str, Any]:
 
 @dataclass(slots=True)
 class MailgunConfig:
-    api_key: str
+    api_key: str = field(repr=False)
     domain: str
     base_url: str = "https://api.mailgun.net"
     timeout: float = 30.0
@@ -266,6 +276,7 @@ class MailgunBackend(_HTTPMixin):
     name: str = "mailgun"
 
     async def send(self, message: EmailMessage) -> SendResult:
+        message.validate()
         data: list[tuple[str, str]] = [
             ("from", message.sender),
             ("subject", message.subject),
@@ -311,7 +322,7 @@ class MailgunBackend(_HTTPMixin):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         if resp.status_code >= 300:
-            logger.debug("Mailgun %s response body: %s", resp.status_code, resp.text)
+            logger.debug("Mailgun %s response body: %s", resp.status_code, resp.text[:500])
             raise SendError(f"Mailgun send failed (status={resp.status_code})")
         body = resp.json()
         return SendResult(
@@ -329,7 +340,7 @@ class MailgunBackend(_HTTPMixin):
 
 @dataclass(slots=True)
 class ResendConfig:
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str = "https://api.resend.com"
     timeout: float = 30.0
 
@@ -340,6 +351,7 @@ class ResendBackend(_HTTPMixin):
     name: str = "resend"
 
     async def send(self, message: EmailMessage) -> SendResult:
+        message.validate()
         body: dict[str, Any] = {
             "from": message.sender,
             "to": message.to,
@@ -375,7 +387,7 @@ class ResendBackend(_HTTPMixin):
             json=body,
         )
         if resp.status_code >= 300:
-            logger.debug("Resend %s response body: %s", resp.status_code, resp.text)
+            logger.debug("Resend %s response body: %s", resp.status_code, resp.text[:500])
             raise SendError(f"Resend send failed (status={resp.status_code})")
         data = resp.json()
         return SendResult(

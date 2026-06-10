@@ -104,9 +104,13 @@ class EmailMessage:
     def all_recipients(self) -> list[str]:
         return [*self.to, *self.cc, *self.bcc]
 
-    def to_mime(self) -> bytes:
-        """Render to RFC822 bytes (used by SMTP + raw-mode SES)."""
-        # Validate every header name/value for CR/LF/NUL before stdlib accepts it.
+    def validate(self) -> None:
+        """Reject CR/LF/NUL in any header-bound field (CWE-74).
+
+        Called by every backend (SMTP/SES via to_mime, and the HTTP backends
+        directly) so subject/sender/recipients and custom headers cannot be
+        used for header injection regardless of provider.
+        """
         _check_header("Subject", self.subject)
         if self.sender:
             _check_header("From", self.sender)
@@ -120,6 +124,11 @@ class EmailMessage:
             _check_header("Reply-To", addr)
         for k, v in self.headers.items():
             _check_header(k, v)
+
+    def to_mime(self) -> bytes:
+        """Render to RFC822 bytes (used by SMTP + raw-mode SES)."""
+        # Validate every header name/value for CR/LF/NUL before stdlib accepts it.
+        self.validate()
 
         msg = _StdlibMessage()
         msg["Subject"] = self.subject

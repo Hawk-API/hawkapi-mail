@@ -8,11 +8,11 @@ from jinja2 import (
     BaseLoader,
     ChoiceLoader,
     DictLoader,
-    Environment,
     FileSystemLoader,
     PackageLoader,
     select_autoescape,
 )
+from jinja2.sandbox import SandboxedEnvironment
 
 
 class TemplateRenderer:
@@ -36,7 +36,9 @@ class TemplateRenderer:
             loaders.append(DictLoader({}))
         loader = loaders[0] if len(loaders) == 1 else ChoiceLoader(loaders)
         ae = select_autoescape(["html", "xml"]) if autoescape else False
-        self.env = Environment(loader=loader, autoescape=ae, enable_async=True)  # noqa: S701
+        # SandboxedEnvironment blocks access to unsafe attributes/builtins so that
+        # user-controllable sources passed to render_string() cannot escalate to RCE.
+        self.env = SandboxedEnvironment(loader=loader, autoescape=ae, enable_async=True)
 
     def render(self, template: str, /, **context: object) -> str:
         tpl = self.env.get_template(template)

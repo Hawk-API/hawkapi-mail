@@ -16,12 +16,14 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger("hawkapi_mail.webhooks")
 
 _SNS_URL_RE = re.compile(r"^https://sns\.[a-z0-9-]+\.amazonaws\.com/")
+_SNS_HOST_RE = re.compile(r"^sns\.[a-z0-9-]+\.amazonaws\.com$")
 
 
 EventKind = Literal[
@@ -275,12 +277,134 @@ def parse_ses_sns(payload: bytes) -> list[WebhookEvent]:
     return []
 
 
-async def confirm_ses_subscription(
+# Field order of the canonical "string to sign" differs by message type.
+# See https://docs.aws.amazon.com/sns/latest/dg/sns-verify-signature-of-message.html
+_SNS_SIGN_FIELDS_NOTIFICATION = ("Message", "MessageId", "Subject", "Timestamp", "TopicArn", "Type")
+_SNS_SIGN_FIELDS_SUBSCRIPTION = (
+    "Message",
+    "MessageId",
+    "SubscribeURL",
+    "Timestamp",
+    "Token",
+    "TopicArn",
+    "Type",
+)
+
+
+def _sns_string_to_sign(raw: dict[str, Any]) -> bytes:
+    """Build the canonical bytes AWS signed, per the SNS message-verification spec.
+
+    ``Subject`` is included only when present (and only for ``Notification``).
+    """
+    msg_type = raw.get("Type", "")
+    if msg_type == "Notification":
+        fields = _SNS_SIGN_FIELDS_NOTIFICATION
+    elif msg_type in ("SubscriptionConfirmation", "UnsubscribeConfirmation"):
+        fields = _SNS_SIGN_FIELDS_SUBSCRIPTION
+    else:
+        raise SignatureError(f"unsupported SNS message type: {msg_type!r}")
+    parts: list[str] = []
+    for key in fields:
+        if key == "Subject" and "Subject" not in raw:
+            continue
+        if key not in raw:
+            raise SignatureError(f"SNS message missing signed field {key!r}")
+        parts.append(f"{key}\n{raw[key]}\n")
+    return "".join(parts).encode("utf-8")
+
+
+async def verify_sns_message(
     payload: bytes, *, client: httpx.AsyncClient | None = None
+) -> None:
+    """Verify an SNS message's RSA signature against its signing certificate.
+
+    Validates ``SigningCertURL`` is HTTPS on an ``sns.<region>.amazonaws.com``
+    host, fetches the certificate (no redirects), rebuilds the canonical
+    string-to-sign, and verifies ``Signature`` with the cert's public key using
+    SHA1 for ``SignatureVersion`` ``"1"`` and SHA256 for ``"2"``. Raises
+    :class:`SignatureError` on any failure (CWE-345).
+    """
+    try:
+        from cryptography import x509  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives import hashes  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.asymmetric import (  # type: ignore[import-not-found]
+            padding,
+            rsa,
+        )
+    except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
+        raise SignatureError(
+            "cryptography is required for SNS signature verification "
+            "(install hawkapi-mail[ses])"
+        ) from exc
+
+    import base64
+
+    raw = json.loads(payload or b"{}")
+
+    sig_version = str(raw.get("SignatureVersion", ""))
+    if sig_version == "1":
+        # SHA1 is mandated by the AWS SNS SignatureVersion 1 spec, not a choice.
+        algorithm = hashes.SHA1()  # noqa: S303
+    elif sig_version == "2":
+        algorithm = hashes.SHA256()
+    else:
+        raise SignatureError(f"unsupported SNS SignatureVersion: {sig_version!r}")
+
+    cert_url = raw.get("SigningCertURL", "")
+    if not cert_url:
+        raise SignatureError("SNS message missing SigningCertURL")
+    parsed = urlparse(cert_url)
+    if parsed.scheme != "https" or not _SNS_HOST_RE.match(parsed.netloc):
+        raise SignatureError(f"untrusted SigningCertURL host: {parsed.netloc!r}")
+
+    signature_b64 = raw.get("Signature", "")
+    if not signature_b64:
+        raise SignatureError("SNS message missing Signature")
+    try:
+        signature = base64.b64decode(signature_b64)
+    except Exception as exc:
+        raise SignatureError(f"SNS Signature not valid base64: {exc}") from exc
+
+    string_to_sign = _sns_string_to_sign(raw)
+
+    own_client = client is None
+    c = client or httpx.AsyncClient(timeout=10.0, follow_redirects=False)
+    try:
+        resp = await c.get(cert_url, follow_redirects=False)
+    finally:
+        if own_client:
+            await c.aclose()
+    if resp.status_code != 200:
+        raise SignatureError(f"fetching SigningCertURL returned {resp.status_code}")
+
+    try:
+        cert = x509.load_pem_x509_certificate(resp.content)
+        public_key = cert.public_key()
+        if not isinstance(public_key, rsa.RSAPublicKey):
+            raise SignatureError("SNS signing certificate is not RSA")
+        public_key.verify(signature, string_to_sign, padding.PKCS1v15(), algorithm)
+    except SignatureError:
+        raise
+    except Exception as exc:
+        raise SignatureError(f"SNS signature verification failed: {exc}") from exc
+
+
+async def confirm_ses_subscription(
+    payload: bytes,
+    *,
+    client: httpx.AsyncClient | None = None,
+    verify_signature: bool = True,
 ) -> bool:
     """When SNS sends a SubscriptionConfirmation, hit ``SubscribeURL`` to confirm.
 
     Returns ``True`` if a confirmation was performed.
+
+    The SNS message's RSA signature is verified against its signing certificate
+    (see :func:`verify_sns_message`) before any network request to
+    ``SubscribeURL`` is made. The ``SubscribeURL`` host is additionally
+    allowlisted to the AWS SNS domain and redirects are disabled
+    (``follow_redirects=False``). Set ``verify_signature=False`` only if the
+    caller has already verified the signature upstream.
     """
     raw = json.loads(payload or b"{}")
     if raw.get("Type") != "SubscriptionConfirmation":
@@ -291,6 +415,8 @@ async def confirm_ses_subscription(
     if not _SNS_URL_RE.match(url):
         logger.warning("Rejecting suspicious SubscribeURL: %s", url[:200])
         return False
+    if verify_signature:
+        await verify_sns_message(payload, client=client)
     own_client = client is None
     c = client or httpx.AsyncClient(timeout=10.0, follow_redirects=False)
     try:
@@ -318,4 +444,5 @@ __all__ = [
     "verify_mailgun",
     "verify_resend",
     "verify_sendgrid",
+    "verify_sns_message",
 ]
