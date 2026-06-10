@@ -6,6 +6,8 @@ Extras: Jinja2 templates, persistent outbox + retry worker, webhook handlers.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+
 from ._backends import (
     Backend,
     InMemoryBackend,
@@ -49,7 +51,10 @@ from ._webhooks import (
     verify_sns_message,
 )
 
-__version__ = "0.3.0"
+try:
+    __version__ = version("hawkapi-mail")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree without install
+    __version__ = "0.0.0"
 
 __all__ = [
     "Attachment",
